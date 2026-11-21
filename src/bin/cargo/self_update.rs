@@ -144,7 +144,9 @@ fn update(home: &Path) -> CargoResult<String> {
     // can only be moved aside.
     let _ = fs::remove_file(bin.join("cargo.old.exe"));
 
-    let latest = latest_release()?;
+    let Some(latest) = latest_release()? else {
+        return Ok(format!("up to date ({current}, no release published)"));
+    };
     if !is_newer(&latest, current) {
         return Ok(format!("up to date ({current})"));
     }
@@ -196,8 +198,9 @@ fn update(home: &Path) -> CargoResult<String> {
     Ok(format!("updated {current} -> {latest}"))
 }
 
-/// The newest release, from where `releases/latest` redirects to.
-fn latest_release() -> CargoResult<String> {
+/// The newest release, from where `releases/latest` redirects to, or `None`
+/// while the repository has none and GitHub redirects to the releases list.
+fn latest_release() -> CargoResult<Option<String>> {
     let mut easy = curl::easy::Easy::new();
     easy.url(&format!("{REPO}/releases/latest"))?;
     easy.follow_location(true)?;
@@ -210,11 +213,14 @@ fn latest_release() -> CargoResult<String> {
         .context("no redirect for the latest release")?
         .to_string();
     let tag = url.rsplit('/').next().unwrap_or("");
+    if tag == "releases" {
+        return Ok(None);
+    }
     let version = tag.strip_prefix('v').unwrap_or(tag);
     if parse_release(version).is_none() {
         bail!("unexpected latest release {tag:?}");
     }
-    Ok(version.to_string())
+    Ok(Some(version.to_string()))
 }
 
 fn download(url: &str) -> CargoResult<Vec<u8>> {

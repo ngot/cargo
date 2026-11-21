@@ -1,21 +1,60 @@
 # ngot/cargo
 
-oden's Cargo fork: [huacnlee/cargo](https://github.com/huacnlee/cargo), which shares build output between git worktrees, merged onto the latest [rust-lang/cargo](https://github.com/rust-lang/cargo) `master`.
-The `oden` branch carries it; `master` mirrors upstream.
+**Every worktree shares one build, and parallel builds no longer deadlock.**
 
-| | |
-| --- | --- |
-| 🔀 Base | `rust-lang/cargo` `master`, merged in, not rebased |
-| 🔒 Fix | Checkouts building the same units at once no longer deadlock on their unit locks (`src/compiler/mod.rs`, `fork_defaults::concurrent_worktrees_do_not_deadlock`) |
-| 📦 Releases | `v<cargo version>-N` tags build every platform (`.github/workflows/release.yml`) |
+A drop-in Cargo for machines running many git worktrees and AI agents at once.
+It is [huacnlee/cargo](https://github.com/huacnlee/cargo), which shares build output between worktrees, merged onto the latest [rust-lang/cargo](https://github.com/rust-lang/cargo) `master`, plus a fix for concurrent builds.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ngot/cargo/oden/install.sh | sh        # Linux and macOS
-irm https://raw.githubusercontent.com/ngot/cargo/oden/install.ps1 | iex             # Windows
+curl -fsSL https://raw.githubusercontent.com/ngot/cargo/oden/install.sh | sh   # Linux and macOS
+irm https://raw.githubusercontent.com/ngot/cargo/oden/install.ps1 | iex        # Windows
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/ngot/cargo/oden/install.sh)" -- --uninstall   # back to rustup's cargo
 ```
 
-An installed huacnlee/cargo is replaced in place; `--uninstall` still restores the rustup cargo.
-The rest of this README is huacnlee's.
+It replaces an installed huacnlee/cargo in place, and `--uninstall` restores the rustup cargo.
+
+## 🚀 Why use it
+
+| | Stock Cargo | huacnlee/cargo | ✅ ngot/cargo |
+| --- | --- | --- | --- |
+| 🌳 A new worktree of a built project | Rebuilds everything | Reuses the build | Reuses the build |
+| 💾 Build output on disk | One `target` per worktree, grows until cleaned | One shared build dir under a size limit | Same |
+| 🤖 Worktrees building the same commit at once | Each builds alone | Can deadlock 🔴 | Finish, one builds and the others reuse it |
+| 🦀 Cargo base | Your toolchain's | `master` of 2026-11-12 | `master` of 2026-11-21, 183 commits newer (0.103.0, Rust 1.102) |
+
+📊 Measured on Linux x64, with a 40-crate workspace and three worktrees of it:
+
+| Scenario | ❌ huacnlee/cargo | ✅ ngot/cargo |
+| --- | --- | --- |
+| 🌳 Build a, then b, then c | 40, 0, 0 crates compiled | 40, 0, 0 crates compiled (757, 198, 201 ms) |
+| 🔒 a, b and c run `cargo test --no-run` together, 3 rounds | Deadlocked in 2 of 3 runs, killed at 120 s | 10 of 10 runs finish |
+| 🧪 `fork_defaults::concurrent_worktrees_do_not_deadlock` | Fails in 2 of 3 runs | Passes in 6 of 6, about 4 s each |
+
+## 🧩 The concurrent build fix
+
+The shared build dir has a lock file per unit, so two Cargos never write the same output at once.
+A Cargo keeps a shared lock on every unit it built until its whole build ends.
+When it needed a unit another Cargo was also building, it waited for that unit's exclusive lock.
+Two or three Cargos each holding units the others wait for formed a cycle, and none of them ever finished.
+
+Now a Cargo first tries the exclusive lock.
+If another Cargo holds the unit, it waits for a shared lock instead, which it gets as soon as that Cargo has built the unit, then reuses the output.
+Only when the output turns out to differ does it wait for the exclusive lock.
+⚠️ That last wait could still form a cycle in theory; no run above reached it, since different sources give a unit a different hash and so a different lock.
+This covers the workspace's own crates as well as registry and git dependencies, since every checkout of a project shares its build dir.
+The change is in `src/compiler/mod.rs` (`prebuild_lock_or_reuse`) and `src/compiler/locking.rs` (`try_lock`).
+
+## 🔀 Branches and releases
+
+| Branch or tag | What |
+| --- | --- |
+| `oden` (default) | The fork: huacnlee's `main` and upstream `master` merged in, not rebased, plus this fix |
+| `master` | Mirror of rust-lang/cargo |
+| `v<cargo version>-N` tags | `.github/workflows/release.yml` builds every platform and publishes the release the installers download |
+
+`cargo -V` names the fork: `cargo 1.102.0 (...) (ngot/cargo, https://github.com/ngot/cargo)`.
+
+The rest of this README is huacnlee's, and describes the build sharing this fork keeps.
 
 # huacnlee/cargo
 

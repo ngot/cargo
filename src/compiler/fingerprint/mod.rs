@@ -2001,7 +2001,7 @@ fn local_fingerprints_deps(
 pub fn built_elsewhere(
     build_runner: &BuildRunner<'_, '_>,
     unit: &Unit,
-) -> Option<impl Fn() -> bool + Send + 'static> {
+) -> Option<impl Fn() -> bool + Send + Sync + 'static> {
     let loc = build_runner.files().fingerprint_file_path(unit, "");
     let fingerprint = Arc::clone(build_runner.fingerprints.get(unit)?);
     Some(move || {

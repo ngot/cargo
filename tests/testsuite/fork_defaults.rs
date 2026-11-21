@@ -479,3 +479,90 @@ fn crates_reading_their_path_are_not_shared() {
 "#]])
         .run();
 }
+
+/// Three worktrees of one project building the same dirty units at once all
+/// finish. Each Cargo keeps a shared lock on every unit it built until its
+/// build ends, so waiting for the exclusive lock of a unit another one built
+/// used to deadlock them; they now wait for its shared lock and reuse it.
+#[cargo_test]
+fn concurrent_worktrees_do_not_deadlock() {
+    const CRATES: usize = 24;
+    let members = (0..CRATES)
+        .map(|i| format!("\"c{i}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let p = git::new("foo", |mut p| {
+        p = p.file(
+            "Cargo.toml",
+            &format!("[workspace]\nresolver = \"2\"\nmembers = [{members}]\n"),
+        );
+        for i in 0..CRATES {
+            let deps = [i.wrapping_sub(1), i.wrapping_sub(2), i / 2]
+                .into_iter()
+                .filter(|&j| j < i)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|j| format!("c{j} = {{ path = \"../c{j}\" }}\n"))
+                .collect::<String>();
+            p = p
+                .file(
+                    &format!("c{i}/Cargo.toml"),
+                    &format!(
+                        "[package]\nname = \"c{i}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"
+                    ),
+                )
+                .file(
+                    &format!("c{i}/src/lib.rs"),
+                    "pub fn f() -> u32 { 1 }\n#[test] fn t() { assert_eq!(f(), 1); }\n",
+                );
+        }
+        p
+    });
+    let repo = git2::Repository::open(p.root()).unwrap();
+    let mut checkouts = vec![p.root()];
+    for name in ["wt-b", "wt-c"] {
+        let dir = paths::root().join(name);
+        repo.worktree(name, &dir, Some(&git2::WorktreeAddOptions::new()))
+            .unwrap();
+        checkouts.push(dir);
+    }
+
+    for round in 0..3 {
+        // A new cfg gives every unit a new hash, so each round starts dirty.
+        let mut children = checkouts
+            .iter()
+            .map(|dir| {
+                let mut command = fork_cargo(&p, "test --no-run -q")
+                    .cwd(dir)
+                    .env("RUSTFLAGS", format!("--cfg=round{round}"))
+                    .build_command();
+                command
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while children
+            .iter_mut()
+            .any(|child| child.try_wait().unwrap().is_none())
+        {
+            if std::time::Instant::now() > deadline {
+                for child in &mut children {
+                    let _ = child.kill();
+                }
+                panic!("round {round}: the three builds deadlocked");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "round {round}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}

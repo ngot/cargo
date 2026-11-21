@@ -72,6 +72,20 @@ impl LockManager {
         Ok(())
     }
 
+    /// Takes the exclusive lock on `key` if no other Cargo holds it; `Ok(false)` when one does.
+    #[instrument(skip(self))]
+    pub fn try_lock(&self, key: &LockKey) -> CargoResult<bool> {
+        let locks = self.locks.read().unwrap();
+        let Some(lock) = locks.get(key) else {
+            bail!("lock was not found in lock manager: {key}");
+        };
+        match flock::try_lock_exclusive(lock.file()) {
+            Ok(()) => Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+            Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
+
     /// Upgrades an existing exclusive lock into a shared lock.
     #[instrument(skip(self))]
     pub fn downgrade_to_shared(&self, key: &LockKey) -> CargoResult<()> {

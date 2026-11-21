@@ -162,6 +162,10 @@ impl<'a, 'gctx> JobState<'a, 'gctx> {
         self.lock_manager.lock(lock)
     }
 
+    pub fn try_lock_exclusive(&self, lock: &LockKey) -> CargoResult<bool> {
+        self.lock_manager.try_lock(lock)
+    }
+
     pub fn downgrade_to_shared(&self, lock: &LockKey) -> CargoResult<()> {
         self.lock_manager.downgrade_to_shared(lock)
     }

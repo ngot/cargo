@@ -243,6 +243,14 @@ fn compile<'gctx>(
         } else {
             let force = exec.force_rebuild(unit) || force_rebuild;
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
+            // Every checkout of the project shares its build-dir too, so path units are contended
+            // like the registry ones in the shared build-dir.
+            let built_elsewhere = if lock.is_some() {
+                fingerprint::built_elsewhere(build_runner, unit)
+                    .map(|f| Arc::new(f) as Arc<dyn Fn() -> bool + Send + Sync>)
+            } else {
+                None
+            };
             let fresh_work = |build_runner: &mut BuildRunner<'_, '_>| -> CargoResult<Work> {
                 let output_options = OutputOptions::for_fresh(build_runner, unit);
                 let manifest = ManifestErrorContext::new(build_runner, unit);
@@ -264,11 +272,10 @@ fn compile<'gctx>(
                 };
                 let work = work.then(link_targets(build_runner, unit, false)?);
                 // Another Cargo may build a shared unit while this one waits
-                // for the exclusive lock below; reuse its output then.
-                match fingerprint::built_elsewhere(build_runner, unit) {
-                    Some(built_elsewhere)
-                        if lock.is_some() && build_runner.files().is_shared_unit(unit) =>
-                    {
+                // for its lock below; reuse its output then.
+                match &built_elsewhere {
+                    Some(built_elsewhere) => {
+                        let built_elsewhere = Arc::clone(built_elsewhere);
                         let fresh = fresh_work(build_runner)?;
                         Work::new(move |state| {
                             if built_elsewhere() {
@@ -278,7 +285,7 @@ fn compile<'gctx>(
                             }
                         })
                     }
-                    _ => work,
+                    None => work,
                 }
             } else {
                 fresh_work(build_runner)?
@@ -296,7 +303,12 @@ fn compile<'gctx>(
                     // We will hold this shared lock for the remainder of compilation to prevent
                     // other cargo from re-compiling while we are still using the unit.
                     build_runner.lock_manager.unlock(&lock)?;
-                    job.before(prebuild_lock_exclusive(lock.clone()));
+                    job.before(match built_elsewhere {
+                        Some(built_elsewhere) => {
+                            prebuild_lock_or_reuse(lock.clone(), built_elsewhere)
+                        }
+                        None => prebuild_lock_exclusive(lock.clone()),
+                    });
                     job.after(downgrade_lock_to_shared(lock));
                 }
             }
@@ -737,6 +749,29 @@ fn prebuild_lock_exclusive(lock: LockKey) -> Work {
     Work::new(move |state| {
         state.lock_exclusive(&lock)?;
         Ok(())
+    })
+}
+
+/// Takes the lock a shared unit's job needs without deadlocking with other Cargos.
+///
+/// A Cargo holds a shared lock on every unit it built until its whole build ends, so blocking on
+/// the exclusive lock of a unit another Cargo built waits for that build to end, while that Cargo
+/// may be blocked on a unit this one holds. So when the exclusive lock is taken, wait for a shared
+/// one instead: it comes once the other Cargo finished the unit, and its output is then reused.
+/// Only a unit still stale after that, which another Cargo merely reads, waits for exclusive.
+fn prebuild_lock_or_reuse(
+    lock: LockKey,
+    built_elsewhere: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Work {
+    Work::new(move |state| {
+        if state.try_lock_exclusive(&lock)? {
+            return Ok(());
+        }
+        state.downgrade_to_shared(&lock)?;
+        if built_elsewhere() {
+            return Ok(());
+        }
+        state.lock_exclusive(&lock)
     })
 }
 

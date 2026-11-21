@@ -1,3 +1,22 @@
+# ngot/cargo
+
+oden's Cargo fork: [huacnlee/cargo](https://github.com/huacnlee/cargo), which shares build output between git worktrees, merged onto the latest [rust-lang/cargo](https://github.com/rust-lang/cargo) `master`.
+The `oden` branch carries it; `master` mirrors upstream.
+
+| | |
+| --- | --- |
+| 🔀 Base | `rust-lang/cargo` `master`, merged in, not rebased |
+| 🔒 Fix | Checkouts building the same units at once no longer deadlock on their unit locks (`src/compiler/mod.rs`, `fork_defaults::concurrent_worktrees_do_not_deadlock`) |
+| 📦 Releases | `v<cargo version>-N` tags build every platform (`.github/workflows/release.yml`) |
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ngot/cargo/oden/install.sh | sh        # Linux and macOS
+irm https://raw.githubusercontent.com/ngot/cargo/oden/install.ps1 | iex             # Windows
+```
+
+An installed huacnlee/cargo is replaced in place; `--uninstall` still restores the rustup cargo.
+The rest of this README is huacnlee's.
+
 # huacnlee/cargo
 
 **Stop deleting `target`.**

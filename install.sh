@@ -1,7 +1,7 @@
 #!/bin/sh
-# Install huacnlee/cargo in place of the rustup `cargo` proxy. No sudo required.
+# Install ngot/cargo in place of the rustup `cargo` proxy. No sudo required.
 #
-#   curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/ngot/cargo/oden/install.sh | sh
 #   sh install.sh --uninstall   # put the rustup proxy back
 #
 # rustup puts its proxy back on `rustup self update` (which `rustup update`
@@ -37,20 +37,25 @@ target="$destination/cargo"
 backup="$destination/cargo.rustup"
 # What the guard restores from, and the guard itself.
 keep="$destination/.cargo-fork"
-label=com.github.huacnlee.cargo-guard
+label=com.github.ngot.cargo-guard
+# The guard huacnlee/cargo installed, replaced by this one.
+old_label=com.github.huacnlee.cargo-guard
 plist="$HOME/Library/LaunchAgents/$label.plist"
 units="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-is_fork() { grep -aq 'huacnlee/cargo' "$1"; }
+# huacnlee/cargo, which this fork carries on, counts too: it is never the rustup cargo.
+is_fork() { grep -aqE 'ngot/cargo|huacnlee/cargo' "$1"; }
 # Keeps what is at $target (usually a link to rustup) as $backup.
 backup_target() {
   if [ -L "$target" ]; then ln -sfn "$(readlink "$target")" "$backup"
   else rm -f "$backup"; cp -p "$target" "$backup"; fi
 }
 remove_guard() {
-  if [ -f "$plist" ]; then
-    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || launchctl unload "$plist" >/dev/null 2>&1 || true
-    rm -f "$plist"
-  fi
+  for name in "$label" "$old_label"; do
+    file="$HOME/Library/LaunchAgents/$name.plist"
+    [ -f "$file" ] || continue
+    launchctl bootout "gui/$(id -u)/$name" >/dev/null 2>&1 || launchctl unload "$file" >/dev/null 2>&1 || true
+    rm -f "$file"
+  done
   if [ -f "$units/cargo-fork-guard.path" ]; then
     systemctl --user disable --now cargo-fork-guard.path >/dev/null 2>&1 || true
     rm -f "$units/cargo-fork-guard.path" "$units/cargo-fork-guard.service"
@@ -60,7 +65,7 @@ remove_guard() {
 
 if [ -n "$uninstall" ]; then
   [ -e "$backup" ] || [ -L "$backup" ] || die "Nothing to restore: $backup does not exist."
-  if is_fork "$backup"; then die "$backup is huacnlee/cargo, not the original; reinstall rustup from https://rustup.rs."; fi
+  if is_fork "$backup"; then die "$backup is a cargo fork, not the original; reinstall rustup from https://rustup.rs."; fi
   # First, or the guard would put this cargo back.
   remove_guard
   if [ -f "$keep/auto-self-update" ] && command -v rustup >/dev/null; then
@@ -84,7 +89,7 @@ case "$(uname -m)" in
   *) die 'Unsupported CPU architecture (requires x86_64 or arm64).' ;;
 esac
 download() { curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location "$@"; }
-repo=https://github.com/huacnlee/cargo
+repo=https://github.com/ngot/cargo
 if [ "$version" = latest ]; then
   release_url="$(download --output /dev/null --write-out '%{url_effective}' "$repo/releases/latest")"
   version="${release_url##*/}"
@@ -142,7 +147,7 @@ bin='$destination'
 GUARD
   cat >> "$keep/guard.sh" <<'GUARD'
 target="$bin/cargo"; keep="$bin/.cargo-fork/cargo"
-is_fork() { grep -aq 'huacnlee/cargo' "$1" 2>/dev/null; }
+is_fork() { grep -aqE 'ngot/cargo|huacnlee/cargo' "$1" 2>/dev/null; }
 [ -f "$keep" ] && is_fork "$keep" || exit 0
 if is_fork "$target"; then
   cmp -s "$target" "$keep" || { cp "$target" "$keep.tmp" && chmod 755 "$keep.tmp" && mv -f "$keep.tmp" "$keep"; }
@@ -152,7 +157,7 @@ if [ -L "$target" ]; then ln -sfn "$(readlink "$target")" "$bin/cargo.rustup"
 elif [ -e "$target" ]; then rm -f "$bin/cargo.rustup"; cp -p "$target" "$bin/cargo.rustup"; fi
 staged="$(mktemp "$bin/.cargo.XXXXXXXX")" || exit 1
 cp "$keep" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$target" || { rm -f "$staged"; exit 1; }
-printf '%s put huacnlee/cargo back after %s was replaced\n' "$(date +%s)" "$target" >> "$bin/.cargo-fork/guard.log"
+printf '%s put ngot/cargo back after %s was replaced\n' "$(date +%s)" "$target" >> "$bin/.cargo-fork/guard.log"
 GUARD
   chmod 755 "$keep/guard.sh"
   case "$platform" in
@@ -178,9 +183,9 @@ PLIST
     Linux)
       if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
         mkdir -p "$units"
-        printf '%s\n' '[Unit]' 'Description=Put huacnlee/cargo back if something replaces it' '' \
+        printf '%s\n' '[Unit]' 'Description=Put ngot/cargo back if something replaces it' '' \
           '[Path]' "PathChanged=$destination" '' '[Install]' 'WantedBy=default.target' > "$units/cargo-fork-guard.path"
-        printf '%s\n' '[Unit]' 'Description=Put huacnlee/cargo back if something replaces it' '' \
+        printf '%s\n' '[Unit]' 'Description=Put ngot/cargo back if something replaces it' '' \
           '[Service]' 'Type=oneshot' "ExecStart=/bin/sh $keep/guard.sh" > "$units/cargo-fork-guard.service"
         if systemctl --user daemon-reload && systemctl --user enable --now cargo-fork-guard.path >/dev/null 2>&1; then
           printf 'Guard installed: systemd user unit cargo-fork-guard.path puts this cargo back if rustup replaces it.\n'

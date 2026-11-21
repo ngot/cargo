@@ -1,4 +1,4 @@
-# Build huacnlee/cargo for every platform and publish a GitHub release when a
+# Build ngot/cargo for every platform and publish a GitHub release when a
 # `v<cargo version>[-N]` tag is pushed, e.g. `v0.102.0-1`. install.sh and
 # install.ps1 download the assets this produces.
 

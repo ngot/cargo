@@ -13,7 +13,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 
-use super::key::{KeyOrIdx, escape_key_part};
+use super::key::KeyOrIdx;
 use super::{ConfigKey, Definition};
 
 use self::ConfigValue as CV;
@@ -69,17 +69,19 @@ impl fmt::Debug for ConfigValue {
 
 impl ConfigValue {
     pub fn from_toml(def: Definition, toml: toml::Value) -> Result<ConfigValue> {
+        use toml_writer::TomlWrite as _;
+
         let mut error_path = Vec::new();
         Self::from_toml_inner(def, toml, &mut error_path).with_context(|| {
             let mut it = error_path.iter().rev().peekable();
             let mut key_path = String::with_capacity(error_path.len() * 3);
             while let Some(k) = it.next() {
                 match k {
-                    KeyOrIdx::Key(s) => key_path.push_str(&escape_key_part(&s)),
+                    KeyOrIdx::Key(s) => key_path.key(s).unwrap(),
                     KeyOrIdx::Idx(i) => key_path.push_str(&format!("[{i}]")),
                 }
                 if matches!(it.peek(), Some(KeyOrIdx::Key(_))) {
-                    key_path.push('.');
+                    key_path.key_sep().unwrap();
                 }
             }
             format!("failed to parse config at `{key_path}`")
@@ -137,38 +139,31 @@ impl ConfigValue {
 
     /// Merge the given value into self.
     ///
-    /// If `force` is true, primitive (non-container) types will override existing values
-    /// of equal priority. For arrays, incoming values of equal priority will be placed later.
+    /// Rules:
     ///
-    /// Container types (tables and arrays) are merged with existing values.
-    ///
-    /// Container and non-container types cannot be mixed.
-    pub fn merge(&mut self, from: ConfigValue, force: bool) -> Result<()> {
-        self.merge_helper(from, force, &mut ConfigKey::new())
+    /// * Tables merge recursively.
+    /// * Prefer the higher-priority definition, keeping the existing value on a tie.
+    /// * For mergeable lists, retain both sides, ordered by definition priority,
+    ///   and incoming entries come first among entries of equal priority.
+    /// * Container and non-container types cannot be mixed (yet).
+    pub fn merge(&mut self, from: ConfigValue) -> Result<()> {
+        self.merge_helper(from, &mut ConfigKey::new())
     }
 
-    fn merge_helper(
-        &mut self,
-        from: ConfigValue,
-        force: bool,
-        parts: &mut ConfigKey,
-    ) -> Result<()> {
+    fn merge_helper(&mut self, from: ConfigValue, parts: &mut ConfigKey) -> Result<()> {
         let is_higher_priority = from.definition().is_higher_priority(self.definition());
         match (self, from) {
-            (&mut CV::List(ref mut old, _), CV::List(ref mut new, _)) => {
+            (&mut CV::List(ref mut old, ref mut old_def), CV::List(ref mut new, new_def)) => {
                 if is_nonmergeable_list(&parts) {
                     // Use whichever list is higher priority.
-                    if force || is_higher_priority {
+                    if is_higher_priority {
                         mem::swap(new, old);
+                        *old_def = new_def;
                     }
                 } else {
                     // Merge the lists together.
-                    if force {
-                        old.append(new);
-                    } else {
-                        new.append(old);
-                        mem::swap(new, old);
-                    }
+                    new.append(old);
+                    mem::swap(new, old);
                 }
                 old.sort_by(|a, b| a.definition().cmp(b.definition()));
             }
@@ -179,7 +174,7 @@ impl ConfigValue {
                             let new_def = value.definition().clone();
                             let entry = entry.get_mut();
                             parts.push(&key);
-                            entry.merge_helper(value, force, parts).with_context(|| {
+                            entry.merge_helper(value, parts).with_context(|| {
                                 format!(
                                     "failed to merge key `{}` between \
                                      {} and {}",
@@ -209,7 +204,7 @@ impl ConfigValue {
                 ));
             }
             (old, mut new) => {
-                if force || is_higher_priority {
+                if is_higher_priority {
                     mem::swap(old, &mut new);
                 }
             }

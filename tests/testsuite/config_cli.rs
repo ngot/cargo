@@ -481,6 +481,28 @@ fn no_comments() {
 a.b = "c"` includes non-whitespace decoration
 "#]],
     );
+
+    let gctx = GlobalContextBuilder::new()
+        .config_arg("a.b = \"c\"\n# exactly")
+        .build_err();
+    assert_error(
+        gctx.unwrap_err(),
+        str![[r#"
+--config argument `a.b = "c"
+# exactly` includes non-whitespace decoration
+"#]],
+    );
+
+    let gctx = GlobalContextBuilder::new()
+        .config_arg("a.b = [\"c\", # exactly\n]")
+        .build_err();
+    assert_error(
+        gctx.unwrap_err(),
+        str![[r#"
+--config argument `a.b = ["c", # exactly
+]` includes non-whitespace decoration
+"#]],
+    );
 }
 
 #[cargo_test]
@@ -520,7 +542,7 @@ Caused by:
   failed to merge key `foo` between --config cli option and --config cli option
 
 Caused by:
-  failed to merge config value from `--config cli option` into `--config cli option`: expected string, but found array
+  failed to merge config value from `--config cli option` into `--config cli option`: expected array, but found string
 "#]],
     );
 }

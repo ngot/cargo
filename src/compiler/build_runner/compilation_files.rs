@@ -380,7 +380,8 @@ impl<'a, 'gctx: 'a> CompilationFiles<'a, 'gctx> {
 
     /// The file that stores the timestamp of a build in it's mtime
     pub fn timestamp_file(&self, unit: &Unit) -> PathBuf {
-        self.fingerprint_dir(unit).join("invoked.timestamp")
+        self.fingerprint_file_path(unit, "")
+            .with_added_extension("timestamp")
     }
 
     /// The directory holding every file of a build unit (new layout).
@@ -1195,7 +1196,7 @@ fn use_extra_filename(bcx: &BuildContext<'_, '_>, unit: &Unit) -> bool {
         let short_name = bcx.target_data.short_name(&unit.kind);
         if (unit.target.is_dylib()
             || unit.target.is_cdylib()
-            || (unit.target.is_executable() && short_name == "wasm32-unknown-emscripten")
+            || (unit.target.is_executable() && short_name.contains("emscripten"))
             || (unit.target.is_executable() && short_name.contains("msvc")))
             && unit.pkg.package_id().source_id().is_path()
             && bcx.gctx.get_env("__CARGO_DEFAULT_LIB_METADATA").is_err()
@@ -1244,7 +1245,7 @@ fn use_pkg_dir(bcx: &BuildContext<'_, '_>, unit: &Unit) -> bool {
     let short_name = bcx.target_data.short_name(&unit.kind);
     if (unit.target.is_dylib()
         || unit.target.is_cdylib()
-        || (unit.target.is_executable() && short_name == "wasm32-unknown-emscripten")
+        || (unit.target.is_executable() && short_name.contains("emscripten"))
         || (unit.target.is_executable() && short_name.contains("msvc")))
         && unit.pkg.package_id().source_id().is_path()
         && bcx.gctx.get_env("__CARGO_DEFAULT_LIB_METADATA").is_err()

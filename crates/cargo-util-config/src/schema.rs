@@ -17,6 +17,7 @@ use std::str::FromStr;
 use std::{fmt, hash};
 
 use cargo_credential::Secret;
+use cargo_util::paths;
 use cargo_util_schemas::manifest::ProfileName;
 use serde::Deserialize;
 use serde::Serialize;
@@ -25,42 +26,174 @@ use serde::de::Error;
 use serde_untagged::UntaggedEnumVisitor;
 
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Result;
 
 use super::CRATES_IO_REGISTRY;
+use super::Definition;
 use super::OptValue;
 use super::Value;
 
+pub use cargo_util_schemas::manifest::TomlProfiles;
+
 /// Cargo's `.cargo/config.toml` file
 #[cfg(feature = "unstable-schema")]
-#[derive(schemars::JsonSchema)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
 pub struct Config {
+    pub include: Option<Vec<IncludeConfig>>,
+
+    pub paths: Option<Vec<ConfigRootRelativePath>>,
+    pub target_applies_to_host: Option<bool>,
+
     pub build: Option<CargoBuildConfig>,
     pub cache: Option<CargoCacheConfig>,
     pub cargo_new: Option<CargoNewConfig>,
+    pub credential_alias: Option<HashMap<String, PathAndArgs>>,
     pub doc: Option<DocConfig>,
     pub env: Option<EnvConfig>,
     pub future_incompat_report: Option<CargoFutureIncompatConfig>,
     pub http: Option<CargoHttpConfig>,
     pub net: Option<CargoNetConfig>,
+    pub patch: Option<HashMap<String, HashMap<String, PatchDependency>>>,
+    pub path_bases: Option<HashMap<String, ConfigRootRelativePath>>,
+    pub profile: Option<TomlProfiles>,
     pub registries: Option<HashMap<String, RegistryConfig>>,
     pub registry: Option<GlobalRegistryConfig>,
     pub resolver: Option<CargoResolverConfig>,
     pub source: Option<HashMap<String, SourceConfigDef>>,
     pub term: Option<TermConfig>,
+    #[schemars(with = "Option<cargo_util_schemas::schema::TomlValueWrapper>")]
+    pub unstable: Option<toml::Value>,
 }
 
 /// Cargo's `credentials.toml` file
 #[cfg(feature = "unstable-schema")]
-#[derive(schemars::JsonSchema)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Credentials {
     pub registry: Option<RegistryCredential>,
     pub registries: Option<HashMap<String, RegistryCredential>>,
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum IncludeConfig {
+    Simple(ConfigParentRelativePath),
+    Detailed(DetailedIncludeConfig),
+}
+
+impl<'de> Deserialize<'de> for IncludeConfig {
+    fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // HACK: Workaround the serialization protocol for `ConfigParentRelativePath` / `Value` is
+        // a newtype, making it messier to use in `IncludeConfig::Simple`.
+        enum RawIncludeConfig {
+            Simple(String),
+            Detailed(DetailedIncludeConfig),
+        }
+
+        impl<'de> Deserialize<'de> for RawIncludeConfig {
+            fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct IncludeVisitor;
+
+                impl<'de> de::Visitor<'de> for IncludeVisitor {
+                    type Value = RawIncludeConfig;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("a config include path or table")
+                    }
+
+                    fn visit_str<E: de::Error>(self, path: &str) -> Result<Self::Value, E> {
+                        self.visit_string(path.to_owned())
+                    }
+
+                    fn visit_string<E: de::Error>(self, path: String) -> Result<Self::Value, E> {
+                        Ok(RawIncludeConfig::Simple(path))
+                    }
+
+                    fn visit_map<M: de::MapAccess<'de>>(
+                        self,
+                        map: M,
+                    ) -> Result<Self::Value, M::Error> {
+                        DetailedIncludeConfig::deserialize(de::value::MapAccessDeserializer::new(
+                            map,
+                        ))
+                        .map(RawIncludeConfig::Detailed)
+                    }
+                }
+
+                deserializer.deserialize_any(IncludeVisitor)
+            }
+        }
+
+        let Value { val, definition } = Value::<RawIncludeConfig>::deserialize(deserializer)?;
+        Ok(match val {
+            RawIncludeConfig::Simple(val) => {
+                Self::Simple(ConfigParentRelativePath::new(Value { val, definition }))
+            }
+            RawIncludeConfig::Detailed(include) => Self::Detailed(include),
+        })
+    }
+}
+
+impl IncludeConfig {
+    pub fn into_detailed(self) -> DetailedIncludeConfig {
+        match self {
+            Self::Simple(path) => DetailedIncludeConfig {
+                path,
+                optional: false,
+            },
+            Self::Detailed(include) => include,
+        }
+    }
+}
+
+/// Represents a config-include value in the configuration.
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[derive(Deserialize, Serialize)]
+pub struct DetailedIncludeConfig {
+    pub path: ConfigParentRelativePath,
+    /// Whether this include is optional (missing files are silently ignored)
+    #[serde(default)]
+    pub optional: bool,
+}
+
+impl DetailedIncludeConfig {
+    /// Resolves the absolute path for this include.
+    ///
+    /// For file based include,
+    /// it is relative to parent directory of the config file includes it.
+    /// For example, if `.cargo/config.toml has a `include = "foo.toml"`,
+    /// Cargo will load `.cargo/foo.toml`.
+    ///
+    /// For CLI based include (e.g., `--config 'include = "foo.toml"'`),
+    /// it is relative to the current working directory.
+    ///
+    /// Returns `None` if this is an optional include and the file doesn't exist.
+    /// Otherwise returns `Some(PathBuf)` with the absolute path.
+    pub fn resolve_path(&self, cwd: &Path) -> Option<PathBuf> {
+        let abs_path = self.path.resolve(cwd);
+        let abs_path = paths::normalize_path(&abs_path);
+
+        if self.optional && !abs_path.exists() {
+            tracing::info!(
+                "skipping optional include `{}` in `{}`:  file not found at `{}`",
+                self.path,
+                self.path.definition(),
+                abs_path.display(),
+            );
+            None
+        } else {
+            Some(abs_path)
+        }
+    }
+}
+
+pub type PatchDependency = cargo_util_schemas::manifest::TomlDependency<ConfigRootRelativePath>;
+
+#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoCacheConfig {
     /// How often to automatically clean unused cache data.
@@ -76,7 +209,7 @@ pub struct CargoCacheConfig {
 ///
 /// If any of these options are `None`, the built-in default is used.
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalCleanConfig {
     /// Anything older than this duration will be deleted in the source cache.
@@ -92,15 +225,13 @@ pub struct GlobalCleanConfig {
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoNewConfig {
     #[deprecated = "cargo-new no longer supports adding the authors field"]
-    #[expect(dead_code, reason = "deprecated")]
     name: Option<String>,
 
     #[deprecated = "cargo-new no longer supports adding the authors field"]
-    #[expect(dead_code, reason = "deprecated")]
     email: Option<String>,
 
     #[serde(rename = "vcs")]
@@ -108,12 +239,14 @@ pub struct CargoNewConfig {
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VersionControl {
     Git,
     Hg,
     Pijul,
     Fossil,
+    #[serde(rename = "none")]
     NoVcs,
 }
 
@@ -158,17 +291,17 @@ impl<'de> de::Deserialize<'de> for VersionControl {
 
 /// Definition of a source in a config file.
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SourceConfigDef {
     /// Indicates this source should be replaced with another of the given name.
     pub replace_with: OptValue<String>,
     /// A directory source.
-    pub directory: Option<ConfigRelativePath>,
+    pub directory: Option<ConfigRootRelativePath>,
     /// A registry source. Value is a URL.
     pub registry: OptValue<String>,
     /// A local registry source.
-    pub local_registry: Option<ConfigRelativePath>,
+    pub local_registry: Option<ConfigRootRelativePath>,
     /// A git source. Value is a URL.
     pub git: OptValue<String>,
     /// The git branch.
@@ -180,7 +313,8 @@ pub struct SourceConfigDef {
 }
 
 #[cfg(feature = "unstable-schema")]
-#[derive(schemars::JsonSchema)]
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
 pub struct DocConfig {
     pub browser: Option<PathAndArgs>,
     pub extern_map: Option<RustdocExternMap>,
@@ -191,7 +325,7 @@ pub struct DocConfig {
 ///
 /// [1]: https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#rustdoc-map
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(serde::Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug)]
 #[serde(default)]
 pub struct RustdocExternMap {
     #[serde(deserialize_with = "default_crates_io_to_docs_rs")]
@@ -236,13 +370,15 @@ impl hash::Hash for RustdocExternMap {
 ///
 /// [1]: https://doc.rust-lang.org/nightly/cargo/reference/unstable.html#rustdoc-map
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Hash)]
+#[derive(Debug, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RustdocExternMode {
     /// Use a local `file://` URL.
     Local,
     /// Use a remote URL to <https://doc.rust-lang.org/> (default).
     Remote,
     /// An arbitrary URL.
+    #[serde(untagged)]
     Url(String),
 }
 
@@ -290,14 +426,14 @@ impl<'de> serde::de::Deserialize<'de> for RustdocExternMode {
 /// ssl-version = "tlsv1.3"
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoHttpConfig {
     pub proxy: Option<String>,
     pub low_speed_limit: Option<u32>,
     pub timeout: Option<u64>,
-    pub cainfo: Option<ConfigRelativePath>,
-    pub proxy_cainfo: Option<ConfigRelativePath>,
+    pub cainfo: Option<ConfigRootRelativePath>,
+    pub proxy_cainfo: Option<ConfigRootRelativePath>,
     pub check_revoke: Option<bool>,
     pub user_agent: Option<String>,
     pub debug: Option<bool>,
@@ -314,14 +450,14 @@ pub struct CargoHttpConfig {
 /// frequency = "always"
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoFutureIncompatConfig {
     frequency: Option<CargoFutureIncompatFrequencyConfig>,
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Default, Deserialize, PartialEq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CargoFutureIncompatFrequencyConfig {
     #[default]
@@ -355,7 +491,8 @@ impl CargoFutureIncompatConfig {
 /// ssl-version.max = "tlsv1.3"
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum SslVersionConfig {
     Single(String),
     Range(SslVersionConfigRange),
@@ -394,7 +531,7 @@ impl<'de> Deserialize<'de> for SslVersionConfig {
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct SslVersionConfigRange {
     pub min: Option<String>,
@@ -412,7 +549,7 @@ pub struct SslVersionConfigRange {
 /// git-fetch-with-cli = true
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoNetConfig {
     pub retry: Option<u32>,
@@ -422,7 +559,7 @@ pub struct CargoNetConfig {
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoSshConfig {
     pub known_hosts: Option<Vec<Value<String>>>,
@@ -441,7 +578,8 @@ pub struct CargoSshConfig {
 /// jobs = "default" # Currently only support "default".
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 pub enum JobsConfig {
     Integer(i32),
     String(String),
@@ -472,25 +610,25 @@ impl<'de> Deserialize<'de> for JobsConfig {
 /// incremental = true
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoBuildConfig {
     // deprecated, but preserved for compatibility
     pub pipelining: Option<bool>,
-    pub dep_info_basedir: Option<ConfigRelativePath>,
-    pub target_dir: Option<ConfigRelativePath>,
-    pub build_dir: Option<ConfigRelativePath>,
+    pub dep_info_basedir: Option<ConfigRootRelativePath>,
+    pub target_dir: Option<ConfigRootRelativePath>,
+    pub build_dir: Option<ConfigRootRelativePathTemplate>,
     pub incremental: Option<bool>,
     pub target: Option<BuildTargetConfig>,
     pub profile: Option<ProfileName>,
     pub jobs: Option<JobsConfig>,
     pub rustflags: Option<StringList>,
     pub rustdocflags: Option<StringList>,
-    pub rustc_wrapper: Option<ConfigRelativePath>,
-    pub rustc_workspace_wrapper: Option<ConfigRelativePath>,
-    pub rustc: Option<ConfigRelativePath>,
-    pub rustdoc: Option<ConfigRelativePath>,
-    pub artifact_dir: Option<ConfigRelativePath>,
+    pub rustc_wrapper: Option<ConfigRootRelativeProgramPath>,
+    pub rustc_workspace_wrapper: Option<ConfigRootRelativeProgramPath>,
+    pub rustc: Option<ConfigRootRelativeProgramPath>,
+    pub rustdoc: Option<ConfigRootRelativeProgramPath>,
+    pub artifact_dir: Option<ConfigRootRelativePath>,
     pub warnings: Option<WarningHandling>,
     /// Unstable feature `-Zsbom`.
     pub sbom: Option<bool>,
@@ -513,7 +651,7 @@ pub struct CargoBuildConfig {
 /// frequency = "1 hour"
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct BuildDirGcConfig {
     pub enabled: Option<bool>,
@@ -544,7 +682,7 @@ pub struct BuildDirGcConfig {
 
 /// Metrics collection for build analysis.
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoBuildAnalysis {
     pub enabled: bool,
@@ -552,7 +690,7 @@ pub struct CargoBuildAnalysis {
 
 /// Whether warnings should warn, be allowed, or cause an error.
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum WarningHandling {
     #[default]
@@ -590,7 +728,7 @@ impl std::fmt::Display for FingerprintMethod {
 
 /// Configuration for `build.build-std`.
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct BuildStdConfig {
     pub when: Option<BuildStdWhen>,
@@ -599,7 +737,7 @@ pub struct BuildStdConfig {
 
 /// When to build the standard library.
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BuildStdWhen {
     Never,
@@ -609,12 +747,14 @@ pub enum BuildStdWhen {
 /// Which standard library crates to build.
 /// Valid values are "core", "alloc", "std", or an array of crate names
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BuildStdCrates {
     Core,
     Alloc,
     Std,
     // Custom list of crates - permanently unstable
+    #[serde(untagged)]
     List(Vec<String>),
 }
 
@@ -648,14 +788,15 @@ impl<'de> Deserialize<'de> for BuildStdCrates {
 /// target = ["a", "b"]
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct BuildTargetConfig {
     inner: Value<BuildTargetConfigInner>,
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
 enum BuildTargetConfigInner {
     One(String),
     Many(Vec<String>),
@@ -712,17 +853,17 @@ impl BuildTargetConfig {
 /// lockfile-path = "my/Cargo.lock"
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoResolverConfig {
     pub incompatible_rust_versions: Option<IncompatibleRustVersions>,
     pub incompatible_publish_age: Option<IncompatiblePublishAge>,
     pub feature_unification: Option<FeatureUnification>,
-    pub lockfile_path: Option<ConfigRelativePath>,
+    pub lockfile_path: Option<ConfigRootRelativePathTemplate>,
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum IncompatibleRustVersions {
     Allow,
@@ -730,7 +871,7 @@ pub enum IncompatibleRustVersions {
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum IncompatiblePublishAge {
     Allow,
@@ -738,7 +879,7 @@ pub enum IncompatiblePublishAge {
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Copy, Clone, Debug, Deserialize)]
+#[derive(Copy, Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FeatureUnification {
     Package,
@@ -758,7 +899,7 @@ pub enum FeatureUnification {
 /// progress.when = "auto"
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct TermConfig {
     pub verbose: Option<bool>,
@@ -766,6 +907,7 @@ pub struct TermConfig {
     pub color: Option<String>,
     pub hyperlinks: Option<bool>,
     pub unicode: Option<bool>,
+    pub graphics: Option<bool>,
     pub progress: Option<ProgressConfig>,
 }
 
@@ -784,7 +926,8 @@ pub struct TermConfig {
 /// progress = { when = "always", width = 80 }
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ProgressConfig {
     pub when: ProgressWhen,
     pub width: Option<usize>,
@@ -793,7 +936,7 @@ pub struct ProgressConfig {
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProgressWhen {
     #[default]
@@ -838,12 +981,15 @@ impl<'de> Deserialize<'de> for ProgressConfig {
 }
 
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
 enum EnvConfigValueInner {
     Simple(String),
     WithOptions {
-        value: ConfigRelativePath,
+        value: ConfigRootRelativePath,
+        #[serde(default)]
         force: bool,
+        #[serde(default)]
         relative: bool,
     },
 }
@@ -855,7 +1001,7 @@ impl<'de> Deserialize<'de> for EnvConfigValueInner {
     {
         #[derive(Deserialize)]
         struct WithOptions {
-            value: ConfigRelativePath,
+            value: ConfigRootRelativePath,
             #[serde(default)]
             force: bool,
             #[serde(default)]
@@ -908,7 +1054,7 @@ impl<'de> Deserialize<'de> for EnvConfigValueInner {
 /// BAZ = { value = "override", force = true }
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct EnvConfigValue {
     inner: EnvConfigValueInner,
@@ -926,7 +1072,7 @@ impl EnvConfigValue {
     /// Resolves the environment variable value.
     ///
     /// If `relative = true`,
-    /// the value is interpreted as a [`ConfigRelativePath`]-like path.
+    /// the value is interpreted as a [`ConfigRootRelativePath`]-like path.
     pub fn resolve<'a>(&'a self, cwd: &Path) -> Cow<'a, OsStr> {
         match self.inner {
             EnvConfigValueInner::Simple(ref s) => Cow::Borrowed(OsStr::new(s.as_str())),
@@ -936,10 +1082,10 @@ impl EnvConfigValue {
                 ..
             } => {
                 if relative {
-                    let p = value.value().definition.root(cwd).join(value.raw_value());
+                    let p = value.resolve(cwd);
                     Cow::Owned(p.into_os_string())
                 } else {
-                    Cow::Borrowed(OsStr::new(value.raw_value()))
+                    Cow::Borrowed(OsStr::new(value.as_str()))
                 }
             }
         }
@@ -950,7 +1096,7 @@ pub type EnvConfig = HashMap<String, EnvConfigValue>;
 
 /// Credentials for a registry.
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RegistryCredential {
     #[cfg_attr(feature = "unstable-schema", schemars(with = "Option<String>"))]
@@ -961,7 +1107,7 @@ pub struct RegistryCredential {
 ///
 /// The values here should be kept in sync with `GlobalRegistryConfig`
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub struct RegistryConfig {
     pub index: Option<String>,
@@ -980,7 +1126,7 @@ pub struct RegistryConfig {
 /// Note: nesting `RegistryConfig` inside this struct and using `serde(flatten)` *should* work
 /// but fails with "invalid type: sequence, expected a value" when attempting to deserialize.
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GlobalRegistryConfig {
     pub index: Option<String>,
@@ -1010,27 +1156,167 @@ impl GlobalRegistryConfig {
     }
 }
 
-/// Use with the `get` API to fetch a string that will be converted to a
-/// `PathBuf`. Relative paths are converted to absolute paths based on the
-/// location of the config file.
-#[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize, PartialEq, Clone)]
-#[serde(transparent)]
-pub struct ConfigRelativePath(Value<String>);
+macro_rules! rel_path {
+    ($name:ident) => {
+        /// A path, potentially relative to the config, not current_dir
+        #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+        #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
+        #[serde(transparent)]
+        pub struct $name(Value<String>);
 
-impl ConfigRelativePath {
-    pub fn new(path: Value<String>) -> ConfigRelativePath {
-        ConfigRelativePath(path)
+        impl $name {
+            pub fn new(path: Value<String>) -> Self {
+                Self(path)
+            }
+
+            /// Returns whether the configured path is an empty string.
+            pub fn is_empty(&self) -> bool {
+                self.as_str().is_empty()
+            }
+
+            /// Returns the underlying value.
+            pub fn as_value(&self) -> &Value<String> {
+                &self.0
+            }
+
+            /// Returns the raw underlying configuration value for this key.
+            pub fn as_str(&self) -> &str {
+                &self.0.val
+            }
+
+            /// PRIVATE: Not to be made public to ensure people dependent on the base path have resolved first
+            fn as_path(&self) -> &Path {
+                Path::new(self.as_str())
+            }
+
+            /// Returns the [extension](Path::extension) of the configured path as written.
+            pub fn extension(&self) -> Option<&OsStr> {
+                // `as_path` is allowed since this is base-agnostic
+                self.as_path().extension()
+            }
+
+            /// Returns where this path was defined.
+            pub fn definition(&self) -> &Definition {
+                &self.0.definition
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Display::fmt(self.as_str(), f)
+            }
+        }
+    };
+}
+
+rel_path!(ConfigRootRelativePath);
+
+impl ConfigRootRelativePath {
+    /// Resolves this configuration-root-relative path to an absolute path.
+    ///
+    /// This will always return an absolute path where it's relative to the
+    /// location for configuration for this value.
+    pub fn resolve(&self, cwd: &Path) -> PathBuf {
+        let value = self.as_value();
+        value.definition.root(cwd).join(&value.val)
     }
+}
 
-    /// Returns the underlying value.
-    pub fn value(&self) -> &Value<String> {
-        &self.0
+rel_path!(ConfigRootRelativeProgramPath);
+
+impl ConfigRootRelativeProgramPath {
+    /// Resolves this configuration-relative path to either an absolute path or
+    /// something appropriate to execute from `PATH`.
+    ///
+    /// Values which don't look like a filesystem path (don't contain `/` or
+    /// `\`) will be returned as-is, and everything else will fall through to an
+    /// absolute path.
+    pub fn resolve(&self, cwd: &Path) -> PathBuf {
+        let value = self.as_str();
+        let is_path = value.contains('/') || (cfg!(windows) && value.contains('\\'));
+        if is_path {
+            self.definition().root(cwd).join(value)
+        } else {
+            // A pathless name.
+            PathBuf::from(value)
+        }
     }
+}
 
-    /// Returns the raw underlying configuration value for this key.
-    pub fn raw_value(&self) -> &str {
-        &self.0.val
+rel_path!(ConfigRootRelativePathTemplate);
+
+impl ConfigRootRelativePathTemplate {
+    /// Applies string replacements before resolving the path.
+    ///
+    /// `replacements` should be an [`IntoIterator`] of tuples with the "from" and "to" for the
+    /// string replacement.
+    pub fn resolve(
+        &self,
+        cwd: &Path,
+        replacements: impl IntoIterator<Item = (impl AsRef<str>, impl AsRef<str>)>,
+    ) -> Result<PathBuf, ResolveTemplateError> {
+        let path = self.as_value();
+        let mut value = path.val.clone();
+
+        for (from, to) in replacements {
+            value = value.replace(from.as_ref(), to.as_ref());
+        }
+
+        // Check for expected variables
+        let re = regex::Regex::new(r"\{(.*)\}").unwrap();
+        if let Some(caps) = re.captures(&value) {
+            return Err(ResolveTemplateError::UnexpectedVariable {
+                variable: caps[1].to_string(),
+                raw_template: path.val.clone(),
+            });
+        };
+
+        if value.contains("{") {
+            return Err(ResolveTemplateError::UnexpectedBracket {
+                bracket_type: BracketType::Opening,
+                raw_template: path.val.clone(),
+            });
+        }
+
+        if value.contains("}") {
+            return Err(ResolveTemplateError::UnexpectedBracket {
+                bracket_type: BracketType::Closing,
+                raw_template: path.val.clone(),
+            });
+        }
+
+        Ok(path.definition.root(cwd).join(&value))
+    }
+}
+
+#[derive(Debug)]
+pub enum ResolveTemplateError {
+    UnexpectedVariable {
+        variable: String,
+        raw_template: String,
+    },
+    UnexpectedBracket {
+        bracket_type: BracketType,
+        raw_template: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum BracketType {
+    Opening,
+    Closing,
+}
+
+rel_path!(ConfigParentRelativePath);
+
+impl ConfigParentRelativePath {
+    /// Resolves this configuration-parent-relative path to an absolute path.
+    ///
+    /// This will always return an absolute path where it's relative to the
+    /// location for configuration for this value.
+    pub fn resolve(&self, cwd: &Path) -> PathBuf {
+        let value = self.as_value();
+        value.definition.parent(cwd).join(&value.val)
     }
 }
 
@@ -1042,16 +1328,17 @@ impl ConfigRelativePath {
 /// This expects the first value to be the path to the program to run.
 /// Subsequent values are strings of arguments to pass to the program.
 ///
-/// Typically you should use `ConfigRelativePathResolveExt::resolve_program` on the path
+/// Typically you should use [`ConfigRootRelativeProgramPath::resolve`] on the path
 /// to get the actual program.
 ///
 /// **Note**: Any usage of this type in config needs to be listed in
 /// the `NON_MERGEABLE_LISTS` check to prevent list merging
 /// from multiple config files.
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
+#[cfg_attr(feature = "unstable-schema", schemars(with = "StringList"))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathAndArgs {
-    pub path: ConfigRelativePath,
+    pub path: ConfigRootRelativeProgramPath,
     pub args: Vec<String>,
 }
 
@@ -1071,15 +1358,23 @@ impl<'de> serde::Deserialize<'de> for PathAndArgs {
             definition: vsl.definition,
         };
         Ok(PathAndArgs {
-            path: ConfigRelativePath(crp),
+            path: ConfigRootRelativeProgramPath(crp),
             args: strings,
         })
     }
 }
 
+impl Serialize for PathAndArgs {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(
+            std::iter::once(self.path.as_str()).chain(self.args.iter().map(String::as_str)),
+        )
+    }
+}
+
 impl PathAndArgs {
     /// Construct a `PathAndArgs` from a string. The string will be split on ascii whitespace,
-    /// with the first item being treated as a `ConfigRelativePath` to the executable, and subsequent
+    /// with the first item being treated as a `ConfigRootRelativeProgramPath` to the executable, and subsequent
     /// items as arguments.
     pub fn from_whitespace_separated_string(p: &Value<String>) -> PathAndArgs {
         let mut iter = p.val.split_ascii_whitespace().map(str::to_string);
@@ -1090,7 +1385,7 @@ impl PathAndArgs {
             definition: p.definition.clone(),
         };
         PathAndArgs {
-            path: ConfigRelativePath(crp),
+            path: ConfigRootRelativeProgramPath(crp),
             args,
         }
     }
@@ -1107,7 +1402,8 @@ impl PathAndArgs {
 /// b = ['a', 'b', 'c']
 /// ```
 #[cfg_attr(feature = "unstable-schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(feature = "unstable-schema", schemars(extend("type" = ["array", "string"])))]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct StringList(Vec<String>);
 
 impl StringList {
